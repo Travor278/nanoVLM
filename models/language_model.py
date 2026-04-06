@@ -3,6 +3,35 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+def _to_additive_attention_mask(
+    attention_mask: torch.Tensor,
+    q: torch.Tensor,
+    T_curr: int,
+    T_kv: int,
+) -> torch.Tensor:
+    """Convert supported mask layouts to an additive mask for attention."""
+    min_value = torch.finfo(q.dtype).min
+
+    if attention_mask.dim() == 2:
+        allowed = attention_mask[:, :T_kv].to(torch.bool).unsqueeze(1).unsqueeze(2)
+    elif attention_mask.dim() == 3:
+        allowed = attention_mask[:, :T_curr, :T_kv].to(torch.bool).unsqueeze(1)
+    elif attention_mask.dim() == 4:
+        allowed = attention_mask[:, :, :T_curr, :T_kv].to(torch.bool)
+    else:
+        raise ValueError(
+            "attention_mask must have shape [B, T], [B, T_q, T_k], or [B, H/T, T_q, T_k]"
+        )
+
+    additive_attn_mask = torch.zeros(
+        allowed.shape,
+        dtype=q.dtype,
+        device=q.device,
+    )
+    additive_attn_mask = additive_attn_mask.masked_fill(~allowed, min_value)
+    return additive_attn_mask
+
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py#L69
 class RMSNorm(nn.Module):
     """
@@ -261,11 +290,12 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         # attention_mask is (B, T_kv_total_length), 1 for attend, 0 for pad
         additive_attn_mask = None
         if attention_mask is not None:
-            # The current `attention_mask` parameter is assumed to be `[B, total_sequence_length_kv]`
-            # Let's make it `[B, 1, 1, T_kv]` for SDPA.
-            mask_for_keys = attention_mask[:, :T_kv] # Ensure mask matches key length [B, T_kv]
-            additive_attn_mask = (1.0 - mask_for_keys.unsqueeze(1).unsqueeze(2).float()) * torch.finfo(q.dtype).min
-            # This additive_attn_mask shape is [B, 1, 1, T_kv]
+            additive_attn_mask = _to_additive_attention_mask(
+                attention_mask,
+                q,
+                T_curr,
+                T_kv,
+            )
 
         if self.sdpa and x.device.type != 'mps':
             # During decode, no additional masking needed as [1, T_kv] is naturally causal
@@ -416,7 +446,14 @@ class LanguageModel(nn.Module):
         elif isinstance(module, RMSNorm):
             module.weight.data.fill_(1.0)
 
-    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor=None, kv_cache: list[dict]=None, start_pos: int=0):
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor=None,
+        kv_cache: list[dict]=None,
+        start_pos: int=0,
+        position_ids: torch.Tensor=None,
+    ):
         """
         Performs a forward pass through the language model.
 
@@ -460,8 +497,18 @@ class LanguageModel(nn.Module):
         # T_curr is the length of the current input sequence
         B, T_curr, _ = x.size()
         
-        # Create position_ids for the current sequence based on start_pos
-        current_position_ids = torch.arange(start_pos, start_pos + T_curr, device=x.device).unsqueeze(0).expand(B, -1)
+        if position_ids is None:
+            current_position_ids = (
+                torch.arange(start_pos, start_pos + T_curr, device=x.device)
+                .unsqueeze(0)
+                .expand(B, -1)
+            )
+        else:
+            current_position_ids = position_ids.to(device=x.device)
+            if current_position_ids.shape != (B, T_curr):
+                raise ValueError(
+                    f"position_ids must have shape {(B, T_curr)}, got {tuple(current_position_ids.shape)}"
+                )
         cos, sin = self.rotary_embd(current_position_ids) # Get rotary position embeddings for current tokens
 
         # Initialize new KV cache if none provided
