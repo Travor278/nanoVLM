@@ -1,3 +1,4 @@
+import itertools
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
@@ -107,12 +108,19 @@ class BaseDataset(Dataset):
 class VQADataset(BaseDataset):  # Visual Question Answering Dataset
     def iter_for_worker(self):  # with iterable datasets, each worker gets different shards
         worker_info = torch.utils.data.get_worker_info()
-        worker_dataset = self.dataset
-
-        if worker_info is not None and hasattr(worker_dataset, "shard"):
-            worker_dataset = worker_dataset.shard(
+        if worker_info is None:
+            worker_dataset = self.dataset
+        elif hasattr(self.dataset, "shard"):
+            worker_dataset = self.dataset.shard(
                 num_shards=worker_info.num_workers,
                 index=worker_info.id,
+            )
+        else:
+            worker_dataset = itertools.islice(
+                self.dataset,
+                worker_info.id,
+                None,
+                worker_info.num_workers,
             )
 
         for data in worker_dataset:

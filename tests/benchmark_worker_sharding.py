@@ -1,74 +1,20 @@
 import argparse
+import multiprocessing
 import sys
 import time
-import types
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-stub_processors = types.ModuleType("data.processors")
-stub_processors.get_image_string = lambda tokenizer, counts, mp_len: ""
-sys.modules.setdefault("data.processors", stub_processors)
-
-from data.datasets import VQADataset
-
-
-class FakeTokenizer:
-    image_token = "<image>"
-    pad_token_id = 0
-
-    def apply_chat_template(
-        self, messages, tokenize=False, add_special_tokens=False, return_dict=False
-    ):
-        if not tokenize:
-            return "".join(message["content"] for message in messages)
-
-        tokens = []
-        for message in messages:
-            if message["role"] == "user":
-                tokens.append(1)
-            else:
-                tokens.append(int(message["content"]))
-
-        if return_dict:
-            return {"input_ids": tokens, "attention_mask": [1] * len(tokens)}
-        return tokens
-
-    def encode(self, text):
-        if not text:
-            return []
-        return [99]
-
-
-class FakeStreamingDataset:
-    def __init__(self, sample_ids):
-        self.sample_ids = list(sample_ids)
-
-    def __iter__(self):
-        for sample_id in self.sample_ids:
-            yield {
-                "images": None,
-                "texts": [{"user": f"user-{sample_id}", "assistant": str(sample_id)}],
-            }
-
-    def shard(self, num_shards, index):
-        return FakeStreamingDataset(self.sample_ids[index::num_shards])
-
-
-class LegacyVQADataset(VQADataset):
-    def iter_for_worker(self):
-        for data in self.dataset:
-            yield self._process_data(data)
-
-
-class FakeWorkerInfo:
-    def __init__(self, worker_id, num_workers):
-        self.id = worker_id
-        self.num_workers = num_workers
+from tests.worker_sharding_utils import (
+    FakeStreamingDataset,
+    LegacyVQADataset,
+    VQADataset,
+    collect_ids_with_dataloader,
+)
 
 
 @dataclass
@@ -92,14 +38,7 @@ class BenchmarkStats:
         return self.total_processed / self.unique_processed if self.unique_processed else 0.0
 
 
-def collect_seen_ids(dataset, worker_id, num_workers):
-    worker_info = FakeWorkerInfo(worker_id, num_workers)
-    with patch("torch.utils.data.get_worker_info", return_value=worker_info):
-        return [int(batch["input_ids"][1].item()) for batch in dataset.iter_for_worker()]
-
-
 def run_case(dataset_cls, num_workers, samples_per_repeat, repeats):
-    tokenizer = FakeTokenizer()
     total_processed = 0
     unique_processed = set()
 
@@ -107,17 +46,13 @@ def run_case(dataset_cls, num_workers, samples_per_repeat, repeats):
     for repeat in range(repeats):
         start_id = 2 + repeat * samples_per_repeat
         sample_ids = list(range(start_id, start_id + samples_per_repeat))
-        dataset = dataset_cls(
+        seen_ids = collect_ids_with_dataloader(
+            dataset_cls,
             FakeStreamingDataset(sample_ids),
-            tokenizer,
-            image_processor=None,
-            mp_image_token_length=1,
+            num_workers=num_workers,
         )
-
-        for worker_id in range(num_workers):
-            seen_ids = collect_seen_ids(dataset, worker_id, num_workers)
-            total_processed += len(seen_ids)
-            unique_processed.update(seen_ids)
+        total_processed += len(seen_ids)
+        unique_processed.update(seen_ids)
 
     elapsed_s = time.perf_counter() - start
     return BenchmarkStats(
@@ -141,13 +76,18 @@ def print_stats(stats):
 
 
 def main():
+    multiprocessing.freeze_support()
     parser = argparse.ArgumentParser(
-        description="CPU benchmark for worker sharding behavior in VQADataset.iter_for_worker()."
+        description="Benchmark real multi-worker DataLoader behavior for VQADataset.iter_for_worker()."
     )
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--samples", type=int, default=2000)
     parser.add_argument("--repeats", type=int, default=5)
     args = parser.parse_args()
+
+    print(
+        f"Running benchmark with workers={args.workers}, samples={args.samples}, repeats={args.repeats}"
+    )
 
     legacy_stats = run_case(
         LegacyVQADataset,
