@@ -106,7 +106,16 @@ class BaseDataset(Dataset):
 
 class VQADataset(BaseDataset):  # Visual Question Answering Dataset
     def iter_for_worker(self):  # with iterable datasets, each worker gets different shards
-        for data in self.dataset:
+        worker_info = torch.utils.data.get_worker_info()
+        worker_dataset = self.dataset
+
+        if worker_info is not None and hasattr(worker_dataset, "shard"):
+            worker_dataset = worker_dataset.shard(
+                num_shards=worker_info.num_workers,
+                index=worker_info.id,
+            )
+
+        for data in worker_dataset:
             yield self._process_data(data)
 
     def __getitem__(self, idx):
