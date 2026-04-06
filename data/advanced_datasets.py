@@ -53,7 +53,8 @@ class ConstantLengthDataset(IterableDataset):
             Iterator[dict]: An iterator that yields training samples with the following structure:
                 - input_ids: Tensor of token ids of shape (seq_length,)
                 - labels: Tensor of labels of shape (seq_length,)
-                - attention_mask: Tensor of attention mask of shape (seq_length,)
+                - attention_mask: Tensor of attention mask of shape (seq_length, seq_length)
+                - position_ids: Tensor of per-token position ids of shape (seq_length,)
                 - images: List of processed image tensors
         """
         worker_info = get_worker_info()
@@ -162,6 +163,7 @@ class ConstantLengthDataset(IterableDataset):
                     "labels":         packed[1],
                     "attention_mask": packed[2],
                     "images":         packed[3],
+                    "position_ids":   packed[4],
                 })
 
             if packed_group:
@@ -222,16 +224,31 @@ class ConstantLengthDataset(IterableDataset):
         return [g for g in knapsack_groups if g]
 
     def _pack_one_group(self, group_indices, batch, max_len):
-        ids, lbl, am, ims = [], [], [], []
+        ids, lbl, key_mask, ims = [], [], [], []
+        position_ids, document_ids = [], []
 
-        for i in group_indices:
+        for document_id, i in enumerate(group_indices):
             ids.extend(batch[i]["input_ids"])
             lbl.extend(batch[i]["labels"])
-            am.extend(batch[i]["attention_mask"])
+            key_mask.extend(batch[i]["attention_mask"])
             ims.extend(batch[i]["images"])
+            position_ids.extend(range(len(batch[i]["input_ids"])))
+            document_ids.extend([document_id] * len(batch[i]["input_ids"]))
 
         # safety: assert we never overflow
         if len(ids) > max_len:
             raise ValueError(f"Packed length {len(ids)} > max_len {max_len}")
 
-        return torch.stack(ids), torch.stack(lbl), torch.stack(am), ims
+        key_mask = torch.stack(key_mask).to(torch.bool)
+        document_ids = torch.tensor(document_ids, dtype=torch.long)
+        same_document = document_ids.unsqueeze(0) == document_ids.unsqueeze(1)
+        attention_mask = same_document & key_mask.unsqueeze(0)
+        attention_mask |= torch.eye(len(document_ids), dtype=torch.bool)
+
+        return (
+            torch.stack(ids),
+            torch.stack(lbl),
+            attention_mask,
+            ims,
+            torch.tensor(position_ids, dtype=torch.long),
+        )

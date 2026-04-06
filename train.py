@@ -378,6 +378,7 @@ def train(train_cfg, vlm_cfg):
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
             attention_mask = batch["attention_mask"].to(device)
+            position_ids = batch["position_ids"].to(device) if "position_ids" in batch else None
             data_load_time = time.time() - data_load_start
 
             # When using DDP with gradient accumulation,
@@ -397,7 +398,13 @@ def train(train_cfg, vlm_cfg):
             )
             with autocast_context:
                 with context:
-                    _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+                    _, loss = model(
+                        input_ids,
+                        images,
+                        attention_mask=attention_mask,
+                        targets=labels,
+                        position_ids=position_ids,
+                    )
 
             if train_cfg.gradient_accumulation_steps > 1:
                 loss = loss / train_cfg.gradient_accumulation_steps
@@ -466,9 +473,16 @@ def train(train_cfg, vlm_cfg):
                         input_ids = batch["input_ids"].to(device)
                         labels = batch["labels"].to(device)
                         attention_mask = batch["attention_mask"].to(device)
+                        position_ids = batch["position_ids"].to(device) if "position_ids" in batch else None
 
                         with autocast_context:
-                            _, loss = model(input_ids, images, attention_mask=attention_mask, targets=labels)
+                            _, loss = model(
+                                input_ids,
+                                images,
+                                attention_mask=attention_mask,
+                                targets=labels,
+                                position_ids=position_ids,
+                            )
 
                         total_val_loss += loss.item()
                         val_batches += 1

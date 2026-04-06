@@ -5,10 +5,37 @@ class BaseCollator(object):
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
 
+    def _pad_attention_mask(self, attention_mask, max_length):
+        if attention_mask.dim() == 1:
+            return torch.nn.functional.pad(
+                attention_mask,
+                (max_length - len(attention_mask), 0),
+                value=0,
+            )
+
+        pad_len = max_length - attention_mask.size(0)
+        if pad_len <= 0:
+            return attention_mask
+
+        padded = torch.zeros(
+            (max_length, max_length),
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
+        padded[pad_len:, pad_len:] = attention_mask
+        padded[:pad_len, :pad_len] = torch.eye(
+            pad_len,
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
+        return padded
+
     def _pad_batch(self, batch, max_length):
         batch["input_ids"] = [torch.nn.functional.pad(ids, (max_length - len(ids), 0), value=self.tokenizer.pad_token_id) for ids in batch["input_ids"]]
         batch["labels"]    = [torch.nn.functional.pad(labels, (max_length - len(labels), 0), value=self.tokenizer.pad_token_id) for labels in batch["labels"]]
-        batch["attention_mask"] = [torch.nn.functional.pad(attention_mask, (max_length - len(attention_mask), 0), value=0) for attention_mask in batch["attention_mask"]]
+        batch["attention_mask"] = [self._pad_attention_mask(attention_mask, max_length) for attention_mask in batch["attention_mask"]]
+        if "position_ids" in batch:
+            batch["position_ids"] = [torch.nn.functional.pad(position_ids, (max_length - len(position_ids), 0), value=0) for position_ids in batch["position_ids"]]
 
     def prepare_batch(self, batch, max_length=None):
         # 1) Handle empty
@@ -37,23 +64,28 @@ class BaseCollator(object):
             max_len = max(map(len, batch["input_ids"]))
         self._pad_batch(batch, max_len) #  dictionaries in Python are mutable and passed by reference
 
-        return {
-            "input_ids": torch.stack(batch["input_ids"]),
-            "attention_mask": torch.stack(batch["attention_mask"]),
+        prepared_batch = {
             "images": batch["images"],
-            "labels": torch.stack(batch["labels"]),
         }
+        for key, values in batch.items():
+            if key == "images":
+                continue
+            prepared_batch[key] = torch.stack(values)
+
+        return prepared_batch
 
     def _discard_samples_that_are_too_long(self, batch, max_length):
-        filtered = [
-            (ids, label, attn, img)
-            for ids, label, attn, img in zip(batch["input_ids"], batch["labels"], batch["attention_mask"], batch["images"])
+        keep_indices = [
+            index
+            for index, ids in enumerate(batch["input_ids"])
             if len(ids) <= max_length
         ]
-        if not filtered:
-            return {"input_ids": [], "labels": [], "attention_mask": [], "images": []}
-        batch_token_ids, batch_labels, batch_attentions, batch_images = zip(*filtered)
-        return {"input_ids": list(batch_token_ids), "labels": list(batch_labels), "attention_mask": list(batch_attentions), "images": list(batch_images)}
+        if not keep_indices:
+            return {key: [] for key in batch}
+        return {
+            key: [values[index] for index in keep_indices]
+            for key, values in batch.items()
+        }
 
 
 class VQACollator(BaseCollator):  # Visual Question Answering Collator
@@ -64,7 +96,9 @@ class VQACollator(BaseCollator):  # Visual Question Answering Collator
     def _pad_batch(self, batch, max_length):  # Reimplementing to use -100 as the pad value for labels, so that it's ignored by the loss
         batch["input_ids"] = [torch.nn.functional.pad(ids, (max_length - len(ids), 0), value=self.tokenizer.pad_token_id) for ids in batch["input_ids"]]
         batch["labels"]    = [torch.nn.functional.pad(labels, (max_length - len(labels), 0), value=-100) for labels in batch["labels"]]
-        batch["attention_mask"] = [torch.nn.functional.pad(attention_mask, (max_length - len(attention_mask), 0), value=0) for attention_mask in batch["attention_mask"]]
+        batch["attention_mask"] = [self._pad_attention_mask(attention_mask, max_length) for attention_mask in batch["attention_mask"]]
+        if "position_ids" in batch:
+            batch["position_ids"] = [torch.nn.functional.pad(position_ids, (max_length - len(position_ids), 0), value=0) for position_ids in batch["position_ids"]]
 
     def __call__(self, batch):
         batch = self.prepare_batch(batch, max_length=self.max_length)
