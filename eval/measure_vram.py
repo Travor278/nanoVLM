@@ -132,6 +132,7 @@ def measure_vram(args, vlm_cfg, train_cfg_defaults):
                 labels = batch["labels"].to(device)
                 attention_mask = batch["attention_mask"].to(device)
                 position_ids = batch["position_ids"].to(device) if "position_ids" in batch else None
+                document_ids = batch["document_ids"].to(device) if "document_ids" in batch else None
 
                 optimizer.zero_grad(set_to_none=True)
 
@@ -142,6 +143,7 @@ def measure_vram(args, vlm_cfg, train_cfg_defaults):
                         attention_mask=attention_mask,
                         targets=labels,
                         position_ids=position_ids,
+                        document_ids=document_ids,
                     )
 
                 if loss is not None:

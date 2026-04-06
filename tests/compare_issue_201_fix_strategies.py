@@ -49,8 +49,7 @@ def build_inputs():
         [[0, 1, 2, 3, 0, 1, 2, 3]], dtype=torch.long
     )
 
-    sample_ids = torch.tensor([[0, 0, 0, -1, 1, 1, 1, -1]], dtype=torch.long)
-    packed_document_mask = build_document_mask(sample_ids)
+    packed_document_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]], dtype=torch.long)
 
     sample_b_only = torch.tensor([[*sample_b, pad_token_id]], dtype=torch.long)
     sample_b_only_padding_mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.long)
@@ -61,7 +60,7 @@ def build_inputs():
         "packed_right": packed_right,
         "packed_padding_mask": packed_padding_mask,
         "packed_reset_positions": packed_reset_positions,
-        "packed_document_mask": packed_document_mask,
+        "packed_document_ids": packed_document_ids,
         "sample_b_only": sample_b_only,
         "sample_b_only_padding_mask": sample_b_only_padding_mask,
         "sample_b_only_positions": sample_b_only_positions,
@@ -70,31 +69,13 @@ def build_inputs():
     }
 
 
-def build_document_mask(sample_ids):
-    batch_size, seq_len = sample_ids.shape
-    mask = torch.zeros((batch_size, seq_len, seq_len), dtype=torch.bool)
-
-    for batch_idx in range(batch_size):
-        for query_idx in range(seq_len):
-            query_doc = sample_ids[batch_idx, query_idx].item()
-            if query_doc < 0:
-                mask[batch_idx, query_idx, query_idx] = True
-                continue
-
-            for key_idx in range(seq_len):
-                key_doc = sample_ids[batch_idx, key_idx].item()
-                if key_doc == query_doc:
-                    mask[batch_idx, query_idx, key_idx] = True
-
-    return mask
-
-
-def run_model(model, input_ids, attention_mask, position_ids=None):
+def run_model(model, input_ids, attention_mask, position_ids=None, document_ids=None):
     with torch.no_grad():
         logits, _ = model(
             input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            document_ids=document_ids,
             start_pos=0,
         )
     return logits
@@ -115,18 +96,21 @@ def compare_mode(
     sample_b_slice,
     packed_position_ids=None,
     sample_b_only_position_ids=None,
+    packed_document_ids=None,
 ):
     packed_left_logits = run_model(
         model,
         packed_left,
         packed_attention_mask,
         position_ids=packed_position_ids,
+        document_ids=packed_document_ids,
     )
     packed_right_logits = run_model(
         model,
         packed_right,
         packed_attention_mask,
         position_ids=packed_position_ids,
+        document_ids=packed_document_ids,
     )
     sample_b_only_logits = run_model(
         model,
@@ -197,15 +181,16 @@ def main():
         ),
         compare_mode(
             model,
-            name="reset_positions_plus_document_mask",
+            name="reset_positions_plus_document_ids",
             packed_left=inputs["packed_left"],
             packed_right=inputs["packed_right"],
-            packed_attention_mask=inputs["packed_document_mask"],
+            packed_attention_mask=inputs["packed_padding_mask"],
             sample_b_only=inputs["sample_b_only"],
             sample_b_only_attention_mask=inputs["sample_b_only_padding_mask"],
             sample_b_slice=sample_b_slice,
             packed_position_ids=inputs["packed_reset_positions"],
             sample_b_only_position_ids=inputs["sample_b_only_positions"],
+            packed_document_ids=inputs["packed_document_ids"],
         ),
     ]
 

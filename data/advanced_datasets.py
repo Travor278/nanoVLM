@@ -53,8 +53,9 @@ class ConstantLengthDataset(IterableDataset):
             Iterator[dict]: An iterator that yields training samples with the following structure:
                 - input_ids: Tensor of token ids of shape (seq_length,)
                 - labels: Tensor of labels of shape (seq_length,)
-                - attention_mask: Tensor of attention mask of shape (seq_length, seq_length)
+                - attention_mask: Tensor of attention mask of shape (seq_length,)
                 - position_ids: Tensor of per-token position ids of shape (seq_length,)
+                - document_ids: Tensor of per-token document ids of shape (seq_length,)
                 - images: List of processed image tensors
         """
         worker_info = get_worker_info()
@@ -164,6 +165,7 @@ class ConstantLengthDataset(IterableDataset):
                     "attention_mask": packed[2],
                     "images":         packed[3],
                     "position_ids":   packed[4],
+                    "document_ids":   packed[5],
                 })
 
             if packed_group:
@@ -239,16 +241,11 @@ class ConstantLengthDataset(IterableDataset):
         if len(ids) > max_len:
             raise ValueError(f"Packed length {len(ids)} > max_len {max_len}")
 
-        key_mask = torch.stack(key_mask).to(torch.bool)
-        document_ids = torch.tensor(document_ids, dtype=torch.long)
-        same_document = document_ids.unsqueeze(0) == document_ids.unsqueeze(1)
-        attention_mask = same_document & key_mask.unsqueeze(0)
-        attention_mask |= torch.eye(len(document_ids), dtype=torch.bool)
-
         return (
             torch.stack(ids),
             torch.stack(lbl),
-            attention_mask,
+            torch.stack(key_mask).to(torch.bool),
             ims,
             torch.tensor(position_ids, dtype=torch.long),
+            torch.tensor(document_ids, dtype=torch.long),
         )

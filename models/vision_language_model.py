@@ -59,7 +59,7 @@ class VisionLanguageModel(nn.Module):
                 return torch.cat(images, dim=0).to(device)
         return images # Already a tensor
 
-    def forward(self, input_ids, images, attention_mask=None, targets=None, position_ids=None):
+    def forward(self, input_ids, images, attention_mask=None, targets=None, position_ids=None, document_ids=None):
         images_tensor = self._process_images(images, input_ids.device)
         token_embd = self.decoder.token_embedding(input_ids) # [B, T_sequence, D_lm]
 
@@ -72,6 +72,7 @@ class VisionLanguageModel(nn.Module):
             token_embd,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            document_ids=document_ids,
         )
 
         loss = None

@@ -5,15 +5,24 @@ import torch.nn.functional as F
 
 
 def _to_additive_attention_mask(
-    attention_mask: torch.Tensor,
+    attention_mask: torch.Tensor | None,
     q: torch.Tensor,
     T_curr: int,
     T_kv: int,
+    document_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Convert supported mask layouts to an additive mask for attention."""
     min_value = torch.finfo(q.dtype).min
 
-    if attention_mask.dim() == 2:
+    if attention_mask is None:
+        if document_ids is None:
+            return None
+        allowed = torch.ones(
+            (document_ids.size(0), 1, T_curr, T_kv),
+            dtype=torch.bool,
+            device=document_ids.device,
+        )
+    elif attention_mask.dim() == 2:
         allowed = attention_mask[:, :T_kv].to(torch.bool).unsqueeze(1).unsqueeze(2)
     elif attention_mask.dim() == 3:
         allowed = attention_mask[:, :T_curr, :T_kv].to(torch.bool).unsqueeze(1)
@@ -23,6 +32,12 @@ def _to_additive_attention_mask(
         raise ValueError(
             "attention_mask must have shape [B, T], [B, T_q, T_k], or [B, H/T, T_q, T_k]"
         )
+
+    if document_ids is not None:
+        q_document_ids = document_ids[:, :T_curr]
+        k_document_ids = document_ids[:, :T_kv]
+        same_document = q_document_ids.unsqueeze(-1) == k_document_ids.unsqueeze(-2)
+        allowed = allowed & same_document.unsqueeze(1)
 
     additive_attn_mask = torch.zeros(
         allowed.shape,
@@ -233,7 +248,15 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         if not self.sdpa:
             print("Warning: scaled dot product attention not available, using standard attention in LM.")
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask=None, block_kv_cache=None) -> tuple[torch.Tensor, dict]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attention_mask=None,
+        block_kv_cache=None,
+        document_ids: torch.Tensor=None,
+    ) -> tuple[torch.Tensor, dict]:
         """
         Forward pass for grouped query attention.
 
@@ -289,12 +312,13 @@ class LanguageModelGroupedQueryAttention(nn.Module):
         # Prepare attention mask for SDPA or manual path
         # attention_mask is (B, T_kv_total_length), 1 for attend, 0 for pad
         additive_attn_mask = None
-        if attention_mask is not None:
+        if attention_mask is not None or document_ids is not None:
             additive_attn_mask = _to_additive_attention_mask(
                 attention_mask,
                 q,
                 T_curr,
                 T_kv,
+                document_ids=document_ids,
             )
 
         if self.sdpa and x.device.type != 'mps':
@@ -386,7 +410,15 @@ class LanguageModelBlock(nn.Module):
         self.norm1 = RMSNorm(cfg) # Input Norm
         self.norm2 = RMSNorm(cfg) # Post Attention Norm
     
-    def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, attention_mask: torch.Tensor=None, block_kv_cache: dict=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        attention_mask: torch.Tensor=None,
+        block_kv_cache: dict=None,
+        document_ids: torch.Tensor=None,
+    ):
         """
         Forward pass of the Transformer block.
 
@@ -406,7 +438,14 @@ class LanguageModelBlock(nn.Module):
         """
         res = x
         x = self.norm1(x)
-        x, block_kv_cache = self.attn(x, cos, sin, attention_mask, block_kv_cache)
+        x, block_kv_cache = self.attn(
+            x,
+            cos,
+            sin,
+            attention_mask,
+            block_kv_cache,
+            document_ids=document_ids,
+        )
         x = res + x
 
         res = x
@@ -453,6 +492,7 @@ class LanguageModel(nn.Module):
         kv_cache: list[dict]=None,
         start_pos: int=0,
         position_ids: torch.Tensor=None,
+        document_ids: torch.Tensor=None,
     ):
         """
         Performs a forward pass through the language model.
@@ -509,6 +549,12 @@ class LanguageModel(nn.Module):
                 raise ValueError(
                     f"position_ids must have shape {(B, T_curr)}, got {tuple(current_position_ids.shape)}"
                 )
+        if document_ids is not None:
+            document_ids = document_ids.to(device=x.device)
+            if document_ids.shape[0] != B or document_ids.shape[1] < T_curr:
+                raise ValueError(
+                    f"document_ids must have shape [B, T] with T >= {T_curr}, got {tuple(document_ids.shape)}"
+                )
         cos, sin = self.rotary_embd(current_position_ids) # Get rotary position embeddings for current tokens
 
         # Initialize new KV cache if none provided
@@ -516,7 +562,14 @@ class LanguageModel(nn.Module):
             kv_cache = [None] * len(self.blocks)
 
         for i, block in enumerate(self.blocks):
-            x, kv_cache[i] = block(x, cos, sin, attention_mask, kv_cache[i])
+            x, kv_cache[i] = block(
+                x,
+                cos,
+                sin,
+                attention_mask,
+                kv_cache[i],
+                document_ids=document_ids,
+            )
 
         x = self.norm(x)
 
