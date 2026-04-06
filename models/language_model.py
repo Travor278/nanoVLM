@@ -4,24 +4,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _to_additive_attention_mask(
+def _to_boolean_attention_mask(
     attention_mask: torch.Tensor | None,
-    q: torch.Tensor,
     T_curr: int,
     T_kv: int,
     document_ids: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Convert supported mask layouts to an additive mask for attention."""
-    min_value = torch.finfo(q.dtype).min
+    causal: bool = False,
+) -> torch.Tensor | None:
+    """Convert supported mask layouts to a boolean mask for attention."""
+    device = None
+    if attention_mask is not None:
+        device = attention_mask.device
+    elif document_ids is not None:
+        device = document_ids.device
 
     if attention_mask is None:
-        if document_ids is None:
+        if document_ids is None and not causal:
             return None
-        allowed = torch.ones(
-            (document_ids.size(0), 1, T_curr, T_kv),
-            dtype=torch.bool,
-            device=document_ids.device,
-        )
+        batch_size = document_ids.size(0) if document_ids is not None else 1
+        allowed = torch.ones((batch_size, 1, T_curr, T_kv), dtype=torch.bool, device=device)
     elif attention_mask.dim() == 2:
         allowed = attention_mask[:, :T_kv].to(torch.bool).unsqueeze(1).unsqueeze(2)
     elif attention_mask.dim() == 3:
@@ -38,6 +39,50 @@ def _to_additive_attention_mask(
         k_document_ids = document_ids[:, :T_kv]
         same_document = q_document_ids.unsqueeze(-1) == k_document_ids.unsqueeze(-2)
         allowed = allowed & same_document.unsqueeze(1)
+
+    if causal:
+        query_positions = torch.arange(T_kv - T_curr, T_kv, device=device)
+        key_positions = torch.arange(T_kv, device=device)
+        causal_mask = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+        allowed = allowed & causal_mask.view(1, 1, T_curr, T_kv)
+
+    return allowed
+
+
+def _needs_explicit_attention_mask(
+    attention_mask: torch.Tensor | None,
+    T_kv: int,
+    document_ids: torch.Tensor | None = None,
+) -> bool:
+    """Return True when attention needs more than the built-in causal mask."""
+    if document_ids is not None:
+        return True
+    if attention_mask is None:
+        return False
+    if attention_mask.dim() != 2:
+        return True
+    return not torch.all(attention_mask[:, :T_kv].to(torch.bool)).item()
+
+
+def _to_additive_attention_mask(
+    attention_mask: torch.Tensor | None,
+    q: torch.Tensor,
+    T_curr: int,
+    T_kv: int,
+    document_ids: torch.Tensor | None = None,
+    causal: bool = False,
+) -> torch.Tensor | None:
+    """Convert supported mask layouts to an additive mask for attention."""
+    min_value = torch.finfo(q.dtype).min
+    allowed = _to_boolean_attention_mask(
+        attention_mask,
+        T_curr,
+        T_kv,
+        document_ids=document_ids,
+        causal=causal,
+    )
+    if allowed is None:
+        return None
 
     additive_attn_mask = torch.zeros(
         allowed.shape,
@@ -311,33 +356,49 @@ class LanguageModelGroupedQueryAttention(nn.Module):
 
         # Prepare attention mask for SDPA or manual path
         # attention_mask is (B, T_kv_total_length), 1 for attend, 0 for pad
-        additive_attn_mask = None
-        if attention_mask is not None or document_ids is not None:
-            additive_attn_mask = _to_additive_attention_mask(
-                attention_mask,
-                q,
-                T_curr,
-                T_kv,
-                document_ids=document_ids,
-            )
+        needs_explicit_mask = _needs_explicit_attention_mask(
+            attention_mask,
+            T_kv,
+            document_ids=document_ids,
+        )
 
         if self.sdpa and x.device.type != 'mps':
-            # During decode, no additional masking needed as [1, T_kv] is naturally causal
+            # SDPA cannot combine attn_mask with is_causal, so fold causal masking in when needed.
             is_causal = (T_curr == T_kv and T_curr > 1)
+            bool_attn_mask = None
+            if needs_explicit_mask:
+                bool_attn_mask = _to_boolean_attention_mask(
+                    attention_mask,
+                    T_curr,
+                    T_kv,
+                    document_ids=document_ids,
+                    causal=is_causal,
+                )
+                is_causal = False
             y = torch.nn.functional.scaled_dot_product_attention(
                 q, k_exp, v_exp,
-                attn_mask=additive_attn_mask, 
+                attn_mask=bool_attn_mask,
                 dropout_p=self.dropout if self.training else 0.0,
                 is_causal=is_causal
             )
         else:
+            additive_attn_mask = None
+            if needs_explicit_mask:
+                additive_attn_mask = _to_additive_attention_mask(
+                    attention_mask,
+                    q,
+                    T_curr,
+                    T_kv,
+                    document_ids=document_ids,
+                    causal=(T_curr == T_kv and T_curr > 1),
+                )
             # Manual attention implementation
             attn = torch.matmul(q, k_exp.transpose(2, 3)) / math.sqrt(self.head_dim) # (B, n_heads, T_curr, T_kv)
-            # During decode: no additional masking needed as [1, T_kv] is naturally causal
-            if T_curr == T_kv and T_curr > 1:
-                causal_mask_val = torch.tril(torch.ones(T_curr, T_curr, device=x.device, dtype=torch.bool)).view(1, 1, T_curr, T_curr)
+            if additive_attn_mask is None and T_curr == T_kv and T_curr > 1:
+                causal_mask_val = torch.tril(
+                    torch.ones(T_curr, T_curr, device=x.device, dtype=torch.bool)
+                ).view(1, 1, T_curr, T_curr)
                 attn = attn.masked_fill(~causal_mask_val, float('-inf'))
-
             if additive_attn_mask is not None: # Additive padding mask
                 # additive_attn_mask is [B,1,1,T_kv], needs to be broadcast to [B, n_heads, T_curr, T_kv]
                 attn = attn + additive_attn_mask 

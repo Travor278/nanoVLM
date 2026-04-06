@@ -14,7 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from models.language_model import LanguageModel, _to_additive_attention_mask
+from models.language_model import LanguageModel, _to_boolean_attention_mask
 
 
 def make_config(
@@ -87,10 +87,9 @@ def persistent_extra_bytes_from_shape(batch_size, seq_len, dtype=torch.long):
     return 2 * batch_size * seq_len * element_size
 
 
-def theoretical_mask_bytes(batch_size, seq_len, q_dtype):
+def theoretical_mask_bytes(batch_size, seq_len):
     same_document_bytes = batch_size * seq_len * seq_len
-    additive_mask_bytes = batch_size * seq_len * seq_len * torch.tensor([], dtype=q_dtype).element_size()
-    return same_document_bytes, additive_mask_bytes
+    return same_document_bytes
 
 
 def synchronize(device):
@@ -98,18 +97,23 @@ def synchronize(device):
         torch.cuda.synchronize(device)
 
 
-def benchmark_mask_builder(device, batch_size, seq_len, q_dtype, steps, warmup, use_document_ids):
-    q = torch.zeros((batch_size, 1, seq_len, 64), dtype=q_dtype, device=device)
+def benchmark_mask_builder(device, batch_size, seq_len, steps, warmup, use_document_ids):
+    if not use_document_ids:
+        return {
+            "avg_ms": 0.0,
+            "peak_bytes": 0,
+        }
+
     attention_mask = torch.ones((batch_size, seq_len), dtype=torch.long, device=device)
     document_ids = torch.arange(seq_len, device=device).div(128, rounding_mode="floor").repeat(batch_size, 1)
 
     for _ in range(warmup):
-        _ = _to_additive_attention_mask(
+        _ = _to_boolean_attention_mask(
             attention_mask,
-            q,
             seq_len,
             seq_len,
             document_ids=document_ids if use_document_ids else None,
+            causal=True,
         )
     synchronize(device)
 
@@ -119,12 +123,12 @@ def benchmark_mask_builder(device, batch_size, seq_len, q_dtype, steps, warmup, 
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         start = time.perf_counter()
-        mask = _to_additive_attention_mask(
+        mask = _to_boolean_attention_mask(
             attention_mask,
-            q,
             seq_len,
             seq_len,
             document_ids=document_ids if use_document_ids else None,
+            causal=True,
         )
         synchronize(device)
         times_ms.append((time.perf_counter() - start) * 1000)
@@ -304,17 +308,14 @@ def main():
             gc.collect()
             print_mode_stats("document_ids", document_stats, baseline=baseline_stats)
 
-    q_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    same_document_bytes, additive_mask_bytes = theoretical_mask_bytes(
+    same_document_bytes = theoretical_mask_bytes(
         args.mask_batch_size,
         args.mask_seq_len,
-        q_dtype,
     )
     baseline_mask_stats = benchmark_mask_builder(
         device,
         batch_size=args.mask_batch_size,
         seq_len=args.mask_seq_len,
-        q_dtype=q_dtype,
         steps=args.steps,
         warmup=args.warmup,
         use_document_ids=False,
@@ -323,7 +324,6 @@ def main():
         device,
         batch_size=args.mask_batch_size,
         seq_len=args.mask_seq_len,
-        q_dtype=q_dtype,
         steps=args.steps,
         warmup=args.warmup,
         use_document_ids=True,
@@ -334,11 +334,7 @@ def main():
         f"{format_bytes(same_document_bytes)}"
     )
     print(
-        f"  theoretical_additive_mask @ B={args.mask_batch_size}, T={args.mask_seq_len}: "
-        f"{format_bytes(additive_mask_bytes)}"
-    )
-    print(
-        f"  baseline_mask_build_avg_ms @ B={args.mask_batch_size}, "
+        f"  baseline_fast_path_mask_build_avg_ms @ B={args.mask_batch_size}, "
         f"T={args.mask_seq_len}: {baseline_mask_stats['avg_ms']:.2f}"
     )
     print(
@@ -347,7 +343,7 @@ def main():
     )
     if device.type == "cuda":
         print(
-            f"  baseline_mask_build_peak: {format_bytes(baseline_mask_stats['peak_bytes'])}"
+            f"  baseline_fast_path_mask_build_peak: {format_bytes(baseline_mask_stats['peak_bytes'])}"
         )
         print(
             f"  document_ids_mask_build_peak: {format_bytes(document_mask_stats['peak_bytes'])}"
